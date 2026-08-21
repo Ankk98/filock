@@ -26,11 +26,15 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::error::{FileLockError, LockType};
 use crate::fd;
+
+/// Global counter for generating unique HolderIds.
+static HOLDER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ============================================================================
 // Public API
@@ -40,10 +44,15 @@ use crate::fd;
 ///
 /// `FileStore` is `Send + Sync` — it can be shared across threads safely.
 /// Create one per application (or per logical "directory of coordinated files").
+///
+/// When a `FileStore` is dropped, all threads blocked on lock acquisition
+/// will be woken and receive an `io::Error` of kind `Other`.
 pub struct FileStore {
     root: PathBuf,
-    state: std::sync::Mutex<StoreState>,
+    state: Mutex<StoreState>,
     cv: std::sync::Condvar,
+    /// Shared shutdown flag — set to true on Drop to wake blocked threads.
+    shutdown: Arc<AtomicBool>,
 }
 
 struct StoreState {
@@ -60,16 +69,19 @@ struct FileLockInfo {
 }
 
 /// Opaque identifier for the current thread.
+///
+/// Uses a thread-local atomic counter to guarantee uniqueness.
+/// Unlike hashing `ThreadId`, this never collides and is never reused
+/// across thread lifetimes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct HolderId(u64);
 
 impl HolderId {
     fn current() -> Self {
-        use std::hash::{Hash, Hasher};
-        let id = std::thread::current().id();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        id.hash(&mut hasher);
-        Self(hasher.finish())
+        thread_local! {
+            static ID: u64 = HOLDER_COUNTER.fetch_add(1, Ordering::Relaxed);
+        }
+        ID.with(|&id| Self(id))
     }
 }
 
@@ -155,6 +167,7 @@ impl FileStore {
                 locks: HashMap::new(),
             }),
             cv: std::sync::Condvar::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -351,6 +364,14 @@ impl FileStore {
                 }
 
                 // Must wait — use timeout or infinite wait
+                // Check shutdown flag
+                if self.shutdown.load(Ordering::SeqCst) {
+                    return Err(FileLockError::Io(io::Error::new(
+                        io::ErrorKind::Other,
+                        "FileStore dropped while lock was pending",
+                    )));
+                }
+
                 match deadline {
                     Some(deadline) => {
                         let now = Instant::now();
@@ -364,6 +385,14 @@ impl FileStore {
                         let remaining = deadline - now;
                         let result = self.cv.wait_timeout(state, remaining).unwrap();
                         state = result.0;
+
+                        // Check shutdown after waking
+                        if self.shutdown.load(Ordering::SeqCst) {
+                            return Err(FileLockError::Io(io::Error::new(
+                                io::ErrorKind::Other,
+                                "FileStore dropped while lock was pending",
+                            )));
+                        }
 
                         if result.1.timed_out() {
                             // Double-check after re-acquiring the mutex
@@ -390,6 +419,13 @@ impl FileStore {
                     }
                     None => {
                         state = self.cv.wait(state).unwrap();
+                        // Check shutdown after waking
+                        if self.shutdown.load(Ordering::SeqCst) {
+                            return Err(FileLockError::Io(io::Error::new(
+                                io::ErrorKind::Other,
+                                "FileStore dropped while lock was pending",
+                            )));
+                        }
                         // Re-check condition after wake
                     }
                 }
@@ -518,22 +554,51 @@ impl FileStore {
         }
     }
 
-    /// Release the in-process lock and notify all waiters.
+    /// Release the in-process lock and notify waiters.
+    ///
+    /// Uses smart notification to reduce thundering herd:
+    /// - When releasing an exclusive lock → `notify_all` (multiple shared
+    ///   waiters may now be able to proceed)
+    /// - When releasing a shared lock and others remain → `notify_one`
+    ///   (only an exclusive waiter could be unblocked)
     fn release_lock(&self, path: &Path, holder: HolderId) {
         // Acquire state, modify, release, then notify.
         // The notifier MUST NOT hold state while notifying, otherwise
         // a waiter could wake up, try to acquire state, and deadlock
         // with another notifier.
+        let notify_all;
         {
             let mut state = self.state.lock().unwrap();
             if let Some(info) = state.locks.get_mut(path) {
+                let was_exclusive = info.effective == Some(LockType::Exclusive);
                 info.remove_holder(&holder);
                 if info.is_empty() {
                     state.locks.remove(path);
                 }
+                // Released exclusive → multiple shared waiters can now proceed
+                // Released shared with others remaining → only exclusive waiter benefits
+                notify_all = was_exclusive;
+            } else {
+                notify_all = true;
             }
         }
         // Mutex released — now safe to notify
+        if notify_all {
+            self.cv.notify_all();
+        } else {
+            self.cv.notify_one();
+        }
+    }
+}
+
+// ============================================================================
+// Drop — wake blocked threads on shutdown
+// ============================================================================
+
+impl Drop for FileStore {
+    fn drop(&mut self) {
+        // Signal all blocked threads to wake up and exit
+        self.shutdown.store(true, Ordering::SeqCst);
         self.cv.notify_all();
     }
 }
