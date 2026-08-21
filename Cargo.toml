@@ -9,6 +9,9 @@ authors = ["Ankit Khandelwal <annk98@gmail.com>"]
 repository = "https://github.com/Ankk98/filock"
 keywords = ["flock", "file", "lock", "concurrency", "thread-safe"]
 categories = ["os", "filesystem"]
+readme = "README.md"
+homepage = "https://github.com/Ankk98/filock"
+documentation = "https://docs.rs/filock"
 
 [dependencies]
 libc = "0.2"
