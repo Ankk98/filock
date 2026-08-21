@@ -1,0 +1,14 @@
+[package]
+name = "filock"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Thread-safe, closure-based file locking for Rust using flock(2)"
+authors = ["Ankit Khandelwal <annk98@gmail.com>"]
+repository = "https://github.com/Ankk98/filock"
+keywords = ["flock", "file", "lock", "concurrency", "thread-safe"]
+categories = ["os", "filesystem"]
+
+[dependencies]
+libc = "0.2"
